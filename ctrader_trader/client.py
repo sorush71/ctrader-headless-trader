@@ -4,18 +4,17 @@ from .config import CTraderConfig
 from .models import TradeOrder, TradeResponse, AccountSummary, OrderType
 from .gateway import CTraderGateway
 from .protocol import ProtoOrderType, TradeSide
+from .risk import RiskManager, RiskConfig, RiskViolationError
 
 logger = logging.getLogger("cTraderClient")
 
 
 class CTraderClient:
     """
-    High-level headless trading client for cTrader Open API.
-    Designed to run on lightweight Linux servers, Docker, or basic Python hosts.
-    Supports real TLS socket connections to Spotware Open API gateways.
+    High-level headless trading client for cTrader Open API with built-in Risk Management.
+    Enforces circuit breakers, max lot caps, mandatory SL, and anti-loop safety.
     """
 
-    # Common Symbol ID mappings for cTrader (default demo symbol IDs)
     SYMBOL_MAP = {
         "EURUSD": 1,
         "GBPUSD": 2,
@@ -28,9 +27,11 @@ class CTraderClient:
         "BTCUSD": 22396
     }
 
-    def __init__(self, config: Optional[CTraderConfig] = None):
+    def __init__(self, config: Optional[CTraderConfig] = None, risk_config: Optional[RiskConfig] = None):
         self.config = config or CTraderConfig.from_env()
         self.gateway = CTraderGateway(self.config)
+        self.risk_manager = RiskManager(risk_config)
+        self._active_positions_count = 0
 
     def connect(self) -> bool:
         """Connects and authorizes with cTrader Open API."""
@@ -56,31 +57,39 @@ class CTraderClient:
     def place_order(self, order: TradeOrder) -> TradeResponse:
         """
         Places a Market, Limit, or Stop order with volume, SL, and TP.
-        Translates to real cTrader Open API protobuf specifications.
+        Enforces strict pre-trade risk validation and financial circuit breakers.
         """
-        self._validate_order(order)
-
-        # 1. Map Symbol
-        symbol_upper = order.symbol.upper()
-        symbol_id = self.SYMBOL_MAP.get(symbol_upper, 1)
-
-        # 2. Map Order Type
-        if order.order_type in [OrderType.BUY, OrderType.SELL]:
-            p_order_type = ProtoOrderType.MARKET
-        elif order.order_type in [OrderType.BUY_LIMIT, OrderType.SELL_LIMIT]:
-            p_order_type = ProtoOrderType.LIMIT
-        elif order.order_type in [OrderType.BUY_STOP, OrderType.SELL_STOP]:
-            p_order_type = ProtoOrderType.STOP
-        else:
-            p_order_type = ProtoOrderType.MARKET
-
-        # 3. Map Side
-        p_side = TradeSide.BUY if "BUY" in order.order_type.value else TradeSide.SELL
-
-        # 4. Convert lot volume to cents (1 lot = 100,000 units = 10,000,000 cents)
-        volume_cents = int(order.volume * 100_000 * 100)
-
         try:
+            self._validate_order(order)
+
+            # 0. Risk Management Pre-Trade Gate
+            account_summary = self.get_account_summary()
+            self.risk_manager.validate_order(
+                order=order,
+                account_summary=account_summary,
+                current_open_positions_count=self._active_positions_count
+            )
+
+            # 1. Map Symbol
+            symbol_upper = order.symbol.upper()
+            symbol_id = self.SYMBOL_MAP.get(symbol_upper, 1)
+
+            # 2. Map Order Type
+            if order.order_type in [OrderType.BUY, OrderType.SELL]:
+                p_order_type = ProtoOrderType.MARKET
+            elif order.order_type in [OrderType.BUY_LIMIT, OrderType.SELL_LIMIT]:
+                p_order_type = ProtoOrderType.LIMIT
+            elif order.order_type in [OrderType.BUY_STOP, OrderType.SELL_STOP]:
+                p_order_type = ProtoOrderType.STOP
+            else:
+                p_order_type = ProtoOrderType.MARKET
+
+            # 3. Map Side
+            p_side = TradeSide.BUY if "BUY" in order.order_type.value else TradeSide.SELL
+
+            # 4. Convert lot volume to cents (1 lot = 100,000 units = 10,000,000 cents)
+            volume_cents = int(order.volume * 100_000 * 100)
+
             res = self.gateway.send_order(
                 symbol_id=symbol_id,
                 order_type=p_order_type,
@@ -91,13 +100,17 @@ class CTraderClient:
                 tp=order.tp,
                 comment=order.comment
             )
+            self._active_positions_count += 1
             return TradeResponse(
                 success=True,
                 order_id=res.get("orderId"),
                 position_id=res.get("positionId"),
                 executed_price=res.get("executionPrice") or order.price,
-                message="Order dispatched via cTrader Open API"
+                message="Order dispatched via cTrader Open API (Risk Checked)"
             )
+        except RiskViolationError as rve:
+            logger.warning(f"Trade blocked by RiskManager: {rve}")
+            return TradeResponse(success=False, error_code="RISK_VIOLATION", message=str(rve))
         except Exception as e:
             logger.error(f"Failed to place order: {e}")
             return TradeResponse(success=False, error_code="EXECUTION_FAILED", message=str(e))
@@ -110,12 +123,17 @@ class CTraderClient:
         """Closes an open position fully or partially."""
         volume_cents = int(volume * 100_000 * 100) if volume else None
         res = self.gateway.close_position(position_id, volume_cents)
+        self._active_positions_count = max(0, self._active_positions_count - 1)
         return TradeResponse(
             success=True,
             position_id=position_id,
             executed_price=res.get("closePrice"),
             message="Position closed successfully"
         )
+
+    def emergency_stop(self, reason: str = "Manual Emergency Stop"):
+        """Instantly trips the circuit breaker and blocks all subsequent orders."""
+        self.risk_manager.trigger_kill_switch(reason)
 
     def _validate_order(self, order: TradeOrder):
         """Sanity checks for order inputs before sending to the broker."""
